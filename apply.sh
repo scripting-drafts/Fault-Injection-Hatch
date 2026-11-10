@@ -29,6 +29,7 @@ update-grub
 
 install -d /etc/faultlab /usr/local/sbin /usr/local/lib \
     /etc/systemd/system/system.slice.d /etc/systemd/system/user.slice.d
+install -d -o root -g adm -m 0750 /var/log/faultlab
 install -m 0644 "$here/systemd/faultlab.slice"            /etc/systemd/system/faultlab.slice
 install -m 0644 "$here/systemd/faultlab-retire.service"   /etc/systemd/system/faultlab-retire.service
 install -m 0644 "$here/systemd/system-slice-allowedcpus.conf" \

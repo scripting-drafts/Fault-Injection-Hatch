@@ -129,3 +129,18 @@ Also run `sudo faultlab-mode status`.
 `sudo ./rollback.sh` restores the newest
 `/etc/default/grub.faultlab.*` backup, removes the units, runs `update-grub`.
 Then `sudo faultlab-mode retired` or reboot.
+
+## 8. QA Sentinels and QA SIEM integration
+
+`faultlab-ab` appends one JSON object per verdict to
+`/var/log/faultlab/ab.jsonl` (0640 root:adm). QA Sentinels consumes new lines
+from a persisted byte cursor and emits `core2.ab.divergence` (critical),
+`core2.ab.hw_suspect` and `core2.ab.control_unstable` (warning). Each cycle it
+also checks the isolation policy and emits `core2.retired.online`,
+`core2.isolation.unfenced`, `core2.isolation.missing`, `core2.lab.*`,
+`core2.irq.affinity` and `core2.topology.*`.
+
+QA SIEM carries matching thresholds in `config/siem.rules.json`; apply them
+with `sudo scripts/sync-rules.sh` in the QA SIEM repository. MCE/EDAC events
+keep their existing `kernel.hardware` and `hardware.edac.*` rules, so there is
+no duplicate core-2 error trigger.

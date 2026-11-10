@@ -4,6 +4,8 @@
 # before it counts as a software bug.
 set -uo pipefail
 
+here=$(cd -- "$(dirname -- "$(readlink -f "$0")")" && pwd)
+
 faulty="2 8"
 control="3,9"
 runs=3
@@ -87,24 +89,41 @@ fault_ok=1
 for rc in "${f_rc[@]}"; do [[ $rc -eq 0 ]] || fault_ok=0; done
 [[ $uniq_f -eq 1 ]] || fault_ok=0
 
+# Machine-readable verdict for the QA Sentinels core-2 trigger.
+record_result() {
+    local verdict=$1 rc=$2
+    local out=${FAULTLAB_RESULTS:-/var/log/faultlab/ab.jsonl}
+    local dir
+    dir=$(dirname -- "$out")
+    mkdir -p -- "$dir" 2>/dev/null || true
+    chgrp adm "$dir" 2>/dev/null || true
+    chmod 0750 "$dir" 2>/dev/null || true
+    python3 "$here/../tools/ab_record.py" "$out" "$verdict" "$rc" "$runs" \
+        "${f_hash[0]:-}" "${c_hash[0]:-}" "$(printf '%q ' "$@")" || true
+}
+
 echo
 if [[ $ctrl_ok -eq 0 ]]; then
     echo "VERDICT: CONTROL-UNSTABLE — fix the environment before testing core 2."
     for i in $(seq 1 "$runs"); do
         [[ ${c_rc[$((i - 1))]} -eq 0 ]] || { echo "--- control stderr (run $i) ---"; tail -5 "$tmp/c.$i.err"; }
     done
+    record_result CONTROL-UNSTABLE 4
     exit 4
 elif [[ $fault_ok -eq 0 ]]; then
     echo "VERDICT: HW-SUSPECT — faulty core misbehaved where the control did not."
     for i in $(seq 1 "$runs"); do
         [[ ${f_rc[$((i - 1))]} -eq 0 ]] || { echo "--- faulty stderr (run $i) ---"; tail -5 "$tmp/f.$i.err"; }
     done
+    record_result HW-SUSPECT 3
     exit 3
 elif [[ ${f_hash[0]} != "${c_hash[0]}" ]]; then
     echo "VERDICT: DIVERGENCE — both succeeded but produced different output."
     echo "Silent-corruption candidate. Do not run this workload in the trusted path."
+    record_result DIVERGENCE 2
     exit 2
 else
     echo "VERDICT: PASS — identical, successful output on both cores."
+    record_result PASS 0
     exit 0
 fi
