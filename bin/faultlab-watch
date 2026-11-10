@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Stream machine-check / EDAC events to the console and a log file.
+set -uo pipefail
+log=${FAULTLAB_LOG:-/var/log/faultlab-mce.log}
+if [[ $EUID -ne 0 ]]; then
+    log=${FAULTLAB_LOG:-$HOME/faultlab-mce.log}
+else
+    ras-mc-ctl --summary 2>/dev/null || true
+fi
+echo "logging to $log (Ctrl-C to stop)"
+journalctl -k -f -o short-iso --no-pager 2>/dev/null |
+    grep --line-buffered -iE 'machine check|mce:|hardware error|edac|corrected|uncorrected' |
+    tee -a "$log"

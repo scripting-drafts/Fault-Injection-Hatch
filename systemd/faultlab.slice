@@ -1,0 +1,5 @@
+[Unit]
+Description=Fault lab slice: physical core 2 (CPUs 2,8)
+
+[Slice]
+AllowedCPUs=2 8

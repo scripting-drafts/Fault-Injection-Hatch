@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Switch between RETIRED (core offline) and LAB (core online, fenced) modes.
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo "faultlab-mode: run with sudo" >&2; exit 1; }
+[[ -d /etc/faultlab ]] || { echo "faultlab-mode: run apply.sh first" >&2; exit 1; }
+
+offline_cpu() {
+    local cpu=$1
+    [[ -e /sys/devices/system/cpu/cpu$cpu/online ]] || return 0
+    [[ $(</sys/devices/system/cpu/cpu$cpu/online) == 0 ]] && return 0
+    local i
+    for i in 1 2 3 4 5; do
+        echo 0 > "/sys/devices/system/cpu/cpu$cpu/online" 2>/dev/null && return 0
+        sleep 1
+    done
+    echo "warning: could not offline CPU$cpu (busy?)" >&2
+    return 1
+}
+
+online_cpu() {
+    local cpu=$1
+    [[ -e /sys/devices/system/cpu/cpu$cpu/online ]] || return 0
+    local i
+    for i in 1 2 3; do
+        echo 1 > "/sys/devices/system/cpu/cpu$cpu/online" 2>/dev/null && return 0
+        sleep 1
+    done
+    echo "error: could not online CPU$cpu" >&2
+    return 1
+}
+
+case ${1:-status} in
+lab)
+    echo lab > /etc/faultlab/mode
+    online_cpu 2
+    online_cpu 8
+    systemctl start faultlab.slice
+    echo "mode=lab: CPUs 2,8 online inside faultlab.slice"
+    ;;
+retired)
+    echo retired > /etc/faultlab/mode
+    offline_cpu 8 || true
+    offline_cpu 2 || true
+    echo "mode=retired: CPUs 2,8 offlined"
+    ;;
+status)
+    printf 'mode:          %s\n' "$(cat /etc/faultlab/mode 2>/dev/null || echo unset)"
+    printf 'cpu2 online:   %s\n' "$(cat /sys/devices/system/cpu/cpu2/online 2>/dev/null || echo n/a)"
+    printf 'cpu8 online:   %s\n' "$(cat /sys/devices/system/cpu/cpu8/online 2>/dev/null || echo n/a)"
+    printf 'isolated:      %s\n' "$(cat /sys/devices/system/cpu/isolated 2>/dev/null)"
+    printf 'nohz_full:     %s\n' "$(cat /sys/devices/system/cpu/nohz_full 2>/dev/null)"
+    printf 'system.slice:  %s\n' "$(cat /sys/fs/cgroup/system.slice/cpuset.cpus.effective 2>/dev/null)"
+    printf 'user.slice:    %s\n' "$(cat /sys/fs/cgroup/user.slice/cpuset.cpus.effective 2>/dev/null)"
+    printf 'faultlab.slice:%s\n' "$(cat /sys/fs/cgroup/faultlab.slice/cpuset.cpus.effective 2>/dev/null)"
+    ;;
+*)
+    echo "usage: faultlab-mode {lab|retired|status}" >&2
+    exit 2
+    ;;
+esac

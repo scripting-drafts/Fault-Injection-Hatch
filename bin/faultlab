@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Run a command pinned to physical core 2 (CPUs 2,8) inside faultlab.slice.
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+    echo "faultlab: root required; the faulty core is fenced from normal users." >&2
+    exit 1
+fi
+[[ $# -gt 0 ]] || { echo "usage: faultlab CMD [ARGS...]" >&2; exit 2; }
+
+online=/sys/devices/system/cpu/cpu2/online
+if [[ ! -e $online || $(<"$online") != 1 || $(</sys/devices/system/cpu/cpu8/online) != 1 ]]; then
+    echo "faultlab: CPUs 2/8 are offline. Enable the lab first: sudo faultlab-mode lab" >&2
+    exit 1
+fi
+
+systemctl start faultlab.slice
+
+args=(--quiet --collect --unit="faultlab-$$-$(date +%s)"
+      --slice=faultlab.slice
+      --property=CPUAffinity="2 8"
+      --property=WorkingDirectory="$PWD"
+      --setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)
+
+if [[ -t 0 && -t 1 ]]; then
+    exec systemd-run "${args[@]}" --pty -- "$@"
+else
+    exec systemd-run "${args[@]}" --wait --pipe -- "$@"
+fi

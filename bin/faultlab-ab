@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# A/B a command on the faulty core (2,8) vs a healthy control core (3,9).
+# Any failure on the faulty core must be reproduced on the control core
+# before it counts as a software bug.
+set -uo pipefail
+
+faulty="2 8"
+control="3,9"
+runs=3
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    --runs) runs=${2:?missing value}; shift 2 ;;
+    --) shift; break ;;
+    -h | --help) echo "usage: faultlab-ab [--runs N] [--] CMD [ARGS...]"; exit 0 ;;
+    *) break ;;
+    esac
+done
+[[ $# -gt 0 ]] || { echo "usage: faultlab-ab [--runs N] [--] CMD [ARGS...]" >&2; exit 2; }
+[[ $runs =~ ^[0-9]+$ && $runs -ge 1 ]] || { echo "faultlab-ab: --runs must be >= 1" >&2; exit 2; }
+[[ $EUID -eq 0 ]] || { echo "faultlab-ab: run with sudo (directly, not inside faultlab)" >&2; exit 1; }
+if [[ $(cat /sys/devices/system/cpu/cpu2/online 2>/dev/null) != 1 ]]; then
+    echo "faultlab-ab: core 2 is offline; run: sudo faultlab-mode lab" >&2
+    exit 1
+fi
+
+allowed=$(awk '/Cpus_allowed_list/{print $2}' /proc/self/status)
+cpu_allowed() {
+    local want=$1 list=$2 part a b
+    local IFS=,
+    for part in $list; do
+        [[ -z $part ]] && continue
+        if [[ $part == *-* ]]; then
+            a=${part%-*}; b=${part#*-}
+            (( want >= a && want <= b )) && return 0
+        else
+            (( want == part )) && return 0
+        fi
+    done
+    return 1
+}
+for c in 3 9; do
+    if ! cpu_allowed "$c" "$allowed"; then
+        echo "faultlab-ab: control CPU $c is not allowed in this shell ($allowed)." >&2
+        echo "Run faultlab-ab directly as root, not inside faultlab.slice." >&2
+        exit 1
+    fi
+done
+
+systemctl start faultlab.slice 2>/dev/null || true
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+f_rc=(); c_rc=(); f_hash=(); c_hash=()
+
+for i in $(seq 1 "$runs"); do
+    if systemd-run --quiet --collect --wait --pipe --slice=faultlab.slice \
+        --property=CPUAffinity="$faulty" --property=WorkingDirectory="$PWD" \
+        -- "$@" >"$tmp/f.$i.out" 2>"$tmp/f.$i.err"; then
+        f_rc+=(0)
+    else
+        f_rc+=($?)
+    fi
+    if taskset -c "$control" "$@" >"$tmp/c.$i.out" 2>"$tmp/c.$i.err"; then
+        c_rc+=(0)
+    else
+        c_rc+=($?)
+    fi
+    f_hash+=("$(sha256sum "$tmp/f.$i.out" | cut -d' ' -f1)")
+    c_hash+=("$(sha256sum "$tmp/c.$i.out" | cut -d' ' -f1)")
+done
+
+uniq_f=$(printf '%s\n' "${f_hash[@]}" | sort -u | wc -l)
+uniq_c=$(printf '%s\n' "${c_hash[@]}" | sort -u | wc -l)
+
+printf '%-8s %-4s %-4s %s\n' CORE RUN RC OUT_SHA256
+for i in $(seq 1 "$runs"); do
+    printf '%-8s %-4s %-4s %.12s\n' faulty "$i" "${f_rc[$((i - 1))]}" "${f_hash[$((i - 1))]}"
+    printf '%-8s %-4s %-4s %.12s\n' control "$i" "${c_rc[$((i - 1))]}" "${c_hash[$((i - 1))]}"
+done
+
+ctrl_ok=1
+for rc in "${c_rc[@]}"; do [[ $rc -eq 0 ]] || ctrl_ok=0; done
+[[ $uniq_c -eq 1 ]] || ctrl_ok=0
+
+fault_ok=1
+for rc in "${f_rc[@]}"; do [[ $rc -eq 0 ]] || fault_ok=0; done
+[[ $uniq_f -eq 1 ]] || fault_ok=0
+
+echo
+if [[ $ctrl_ok -eq 0 ]]; then
+    echo "VERDICT: CONTROL-UNSTABLE — fix the environment before testing core 2."
+    for i in $(seq 1 "$runs"); do
+        [[ ${c_rc[$((i - 1))]} -eq 0 ]] || { echo "--- control stderr (run $i) ---"; tail -5 "$tmp/c.$i.err"; }
+    done
+    exit 4
+elif [[ $fault_ok -eq 0 ]]; then
+    echo "VERDICT: HW-SUSPECT — faulty core misbehaved where the control did not."
+    for i in $(seq 1 "$runs"); do
+        [[ ${f_rc[$((i - 1))]} -eq 0 ]] || { echo "--- faulty stderr (run $i) ---"; tail -5 "$tmp/f.$i.err"; }
+    done
+    exit 3
+elif [[ ${f_hash[0]} != "${c_hash[0]}" ]]; then
+    echo "VERDICT: DIVERGENCE — both succeeded but produced different output."
+    echo "Silent-corruption candidate. Do not run this workload in the trusted path."
+    exit 2
+else
+    echo "VERDICT: PASS — identical, successful output on both cores."
+    exit 0
+fi

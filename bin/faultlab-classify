@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Phase 1: characterise core 2. Requires lab mode.
+set -uo pipefail
+[[ $EUID -eq 0 ]] || { echo "faultlab-classify: run with sudo" >&2; exit 1; }
+self=$(readlink -f "${BASH_SOURCE[0]}")
+home=${FAULTLAB_HOME:-$(cd -- "$(dirname -- "$self")/.." && pwd)}
+fl=$home/bin/faultlab
+[[ -x $fl ]] || fl=/usr/local/sbin/faultlab
+duration=${1:-300}
+log=$home/sessions.log
+
+if [[ $(cat /sys/devices/system/cpu/cpu2/online 2>/dev/null) != 1 ]]; then
+    echo "core 2 is offline; run: sudo faultlab-mode lab" >&2
+    exit 1
+fi
+
+{
+    echo
+    echo "=== session $(date -Is) duration=${duration}s ==="
+    grep -m1 microcode /proc/cpuinfo
+    cat /proc/cmdline
+} | tee -a "$log"
+
+echo "== RAS baseline ==" | tee -a "$log"
+ras-mc-ctl --summary 2>&1 | tee -a "$log"
+ras-mc-ctl --errors 2>&1 | tee -a "$log"
+
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+(
+    while :; do
+        sensors 2>/dev/null | awk '/Tctl|Tdie|Package id 0/{printf "%s %s %s\n", strftime("%H:%M:%S"), $1, $2}'
+        sleep 10
+    done
+) >"$tmp/temps" &
+mon=$!
+
+echo "== load soak on faulty core (${duration}s) ==" | tee -a "$log"
+$fl stress-ng --cpu 2 --cpu-method all --timeout "$duration" --metrics-brief 2>&1 | tee -a "$log"
+echo "== load soak on control core (${duration}s) ==" | tee -a "$log"
+taskset -c 3,9 stress-ng --cpu 2 --cpu-method all --timeout "$duration" --metrics-brief 2>&1 | tee -a "$log"
+kill "$mon" 2>/dev/null; wait "$mon" 2>/dev/null
+
+echo "== peak temperatures ==" | tee -a "$log"
+sort -k3 "$tmp/temps" 2>/dev/null | tail -5 | tee -a "$log"
+
+echo "== RAS after ==" | tee -a "$log"
+ras-mc-ctl --summary 2>&1 | tee -a "$log"
+ras-mc-ctl --errors 2>&1 | tee -a "$log"
+journalctl -k --since '-2 hours' 2>/dev/null |
+    grep -iE 'machine check|mce:|hardware error' | tail -20 | tee -a "$log"
+
+echo "== determinism A/B (silent corruption probe) ==" | tee -a "$log"
+$home/bin/faultlab-ab --runs 3 -- python3 "$home/tools/sdc_probe.py" 2>&1 | tee -a "$log"
+rc=${PIPESTATUS[0]}
+
+echo "== done; A/B exit=$rc. Log: $log ==" | tee -a "$log"
+exit "$rc"
