@@ -1,4 +1,4 @@
-# Fault Injection Rig
+# Fault Injection Hatch
 
 A Linux CPU-isolation and fault-characterisation toolkit for investigating a suspected degrading processor core.
 
