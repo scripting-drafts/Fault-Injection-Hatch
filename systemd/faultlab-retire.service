@@ -1,6 +1,6 @@
 [Unit]
-Description=Retire faulty physical core 2 (CPUs 2,8)
-Documentation=https://github.com/scripting-drafts/fault-injection-rig/blob/main/docs/fault-core-plan.md
+Description=Retire the faulty physical core
+Documentation=https://github.com/scripting-drafts/Fault-Injection-Hatch#readme
 After=sysinit.target
 ConditionPathExists=/etc/faultlab/mode
 
@@ -8,7 +8,7 @@ ConditionPathExists=/etc/faultlab/mode
 Type=oneshot
 RemainAfterExit=yes
 ExecCondition=/bin/sh -c 'grep -qx retired /etc/faultlab/mode'
-ExecStart=/bin/sh -c 'for i in 1 2 3; do echo 0 > /sys/devices/system/cpu/cpu8/online 2>/dev/null && break; sleep 1; done; for i in 1 2 3; do echo 0 > /sys/devices/system/cpu/cpu2/online 2>/dev/null && break; sleep 1; done; true'
+ExecStart=/usr/local/sbin/faultlab-retire
 
 [Install]
 WantedBy=multi-user.target

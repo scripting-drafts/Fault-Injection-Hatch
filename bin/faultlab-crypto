@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 # Dispatch to the RSA-CRT fault test shipped with this rig.
 set -euo pipefail
-self=$(readlink -f "${BASH_SOURCE[0]}")
-home=$(cd -- "$(dirname -- "$self")/.." && pwd)
-exec python3 "$home/crypto/fault_crypto_test.py" "$@"
+
+conf=${FAULTLAB_CONF:-/etc/faultlab/config}
+if [[ -r $conf ]]; then
+    # shellcheck disable=SC1090
+    . "$conf"
+fi
+if [[ -z ${FAULTLAB_HOME:-} ]]; then
+    d=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    for candidate in "$d/.." /usr/local/lib/fault-injection-rig; do
+        if [[ -r $candidate/lib/faultlab-common.sh ]]; then
+            FAULTLAB_HOME=$(cd -- "$candidate" && pwd)
+            break
+        fi
+    done
+fi
+[[ -n ${FAULTLAB_HOME:-} && -r $FAULTLAB_HOME/crypto/fault_crypto_test.py ]] ||
+    { echo "faultlab-crypto: cannot locate crypto test; set FAULTLAB_HOME or run apply.sh" >&2; exit 1; }
+exec python3 "$FAULTLAB_HOME/crypto/fault_crypto_test.py" "$@"

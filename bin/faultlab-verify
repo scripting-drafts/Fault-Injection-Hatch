@@ -1,38 +1,47 @@
 #!/usr/bin/env bash
-# Verify that isolation is active and that core 2 is actually fenced off.
+# Verify that isolation is active and that the faulty core is fenced off.
 set -uo pipefail
-pass=0; warn=0; fail=0
-ok()   { printf 'PASS  %s\n' "$*"; pass=$((pass + 1)); }
-note() { printf 'WARN  %s\n' "$*"; warn=$((warn + 1)); }
-bad()  { printf 'FAIL  %s\n' "$*"; fail=$((fail + 1)); }
-readfile() { cat "$1" 2>/dev/null || true; }
 
-cpu_in_list() {
-    local want=$1 list=$2 part a b
-    [[ $list =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || return 1
-    local IFS=,
-    for part in $list; do
-        if [[ $part == *-* ]]; then
-            a=${part%-*}; b=${part#*-}
-            (( want >= a && want <= b )) && return 0
-        else
-            (( want == part )) && return 0
+conf=${FAULTLAB_CONF:-/etc/faultlab/config}
+if [[ -r $conf ]]; then
+    # shellcheck disable=SC1090
+    . "$conf"
+fi
+if [[ -z ${FAULTLAB_HOME:-} ]]; then
+    d=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    for candidate in "$d/.." /usr/local/lib/fault-injection-rig; do
+        if [[ -r $candidate/lib/faultlab-common.sh ]]; then
+            FAULTLAB_HOME=$(cd -- "$candidate" && pwd)
+            break
         fi
     done
-    return 1
-}
+fi
+[[ -n ${FAULTLAB_HOME:-} && -r $FAULTLAB_HOME/lib/faultlab-common.sh ]] ||
+    { echo "faultlab-verify: cannot locate lib; set FAULTLAB_HOME or run apply.sh" >&2; exit 1; }
+. "$FAULTLAB_HOME/lib/faultlab-common.sh"
+
+fl_load_topology
+
+pass=0
+warn=0
+fail=0
+ok() { printf 'PASS  %s\n' "$*"; pass=$((pass + 1)); }
+note() { printf 'WARN  %s\n' "$*"; warn=$((warn + 1)); }
+bad() { printf 'FAIL  %s\n' "$*"; fail=$((fail + 1)); }
+readfile() { cat "$1" 2>/dev/null || true; }
 
 cmdline=$(readfile /proc/cmdline)
 echo "cmdline: $cmdline"
+echo "faulty core: CPUs $FAULT_CPUS; control core: CPUs $CONTROL_CPUS"
 for token in isolcpus nohz_full rcu_nocbs irqaffinity; do
     if grep -qE "(^| )$token=" <<<"$cmdline"; then ok "$token present"; else bad "$token missing"; fi
 done
 
 isolated=$(readfile /sys/devices/system/cpu/isolated)
 nohz=$(readfile /sys/devices/system/cpu/nohz_full)
-for cpu in 2 8; do
-    cpu_in_list "$cpu" "$isolated" && ok "CPU$cpu isolated" || bad "CPU$cpu not isolated"
-    cpu_in_list "$cpu" "$nohz" && ok "CPU$cpu in nohz_full" || bad "CPU$cpu not in nohz_full"
+for cpu in $(fl_expand_cpus "$FAULT_CPUS"); do
+    fl_list_has "$isolated" "$cpu" && ok "CPU$cpu isolated" || bad "CPU$cpu not isolated"
+    fl_list_has "$nohz" "$cpu" && ok "CPU$cpu in nohz_full" || bad "CPU$cpu not in nohz_full"
 done
 
 for slice in system.slice user.slice; do
@@ -40,34 +49,54 @@ for slice in system.slice user.slice; do
     effective=$(readfile "/sys/fs/cgroup/$slice/cpuset.cpus.effective")
     echo "$slice: cpus='$configured' effective='$effective'"
     if [[ -z $configured ]]; then
-        bad "$slice is unrestricted (inherits all CPUs, incl. core 2)"
-    elif cpu_in_list 2 "$configured" || cpu_in_list 8 "$configured"; then
-        bad "$slice can still place work on core 2"
+        bad "$slice is unrestricted (inherits all CPUs, incl. the faulty core)"
     else
-        ok "$slice fenced off core 2"
+        leaked=0
+        for cpu in $(fl_expand_cpus "$FAULT_CPUS"); do
+            fl_list_has "$configured" "$cpu" && leaked=1
+        done
+        if ((leaked)); then
+            bad "$slice can still place work on the faulty core"
+        else
+            ok "$slice fenced off the faulty core"
+        fi
     fi
 done
 
 lab=$(readfile /sys/fs/cgroup/faultlab.slice/cpuset.cpus)
-if [[ -n $lab ]] && cpu_in_list 2 "$lab" && cpu_in_list 8 "$lab"; then
-    ok "faultlab.slice holds core 2 ('$lab')"
+missing=""
+for cpu in $(fl_expand_cpus "$FAULT_CPUS"); do
+    fl_list_has "$lab" "$cpu" || missing="$missing $cpu"
+done
+if [[ -n $lab && -z $missing ]]; then
+    ok "faultlab.slice holds the faulty core ('$lab')"
 else
-    note "faultlab.slice not configured or not started ('$lab')"
+    note "faultlab.slice not configured or not started ('$lab'; missing:${missing:- none})"
 fi
 
-for cpu in 2 8; do
+online=1
+for cpu in $(fl_expand_cpus "$FAULT_CPUS"); do
     state=$(readfile "/sys/devices/system/cpu/cpu$cpu/online")
     [[ -n $state ]] && echo "CPU$cpu online=$state"
+    if [[ -e /sys/devices/system/cpu/cpu$cpu/online && $state == 0 ]]; then
+        online=0
+    fi
+done
+for cpu in $(fl_expand_cpus "$CONTROL_CPUS"); do
+    state=$(readfile "/sys/devices/system/cpu/cpu$cpu/online")
+    [[ -z $state || $state == 1 ]] && ok "control CPU$cpu online" || bad "control CPU$cpu offline"
 done
 
 echo
-echo "--- tasks sampled on CPUs 2/8 ---"
-tasks=$(ps -eLo psr=,pid=,comm= 2>/dev/null | awk '$1 == 2 || $1 == 8')
+echo "--- tasks sampled on faulty CPUs ---"
+tasks=$(ps -eLo psr=,pid=,comm= 2>/dev/null | awk -v list="$(fl_cpus_spaces "$FAULT_CPUS")" '
+    BEGIN { n = split(list, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+    want[$1] { print }')
 if [[ -z $tasks ]]; then
-    ok "no tasks on CPUs 2/8"
+    ok "no tasks on the faulty core"
 else
     user_tasks=$(while read -r psr pid comm; do
-        if IFS= read -r -d '' _ < "/proc/$pid/cmdline" 2>/dev/null; then
+        if [[ -s /proc/$pid/cmdline ]]; then
             printf '%s %s %s\n' "$psr" "$pid" "$comm"
         fi
     done <<<"$tasks")
@@ -75,7 +104,7 @@ else
         count=$(wc -l <<<"$user_tasks")
         head -10 <<<"$user_tasks"
         [[ $count -gt 10 ]] && echo "... ($count user tasks total)"
-        bad "$count user tasks found on the fault core"
+        bad "$count user tasks found on the faulty core"
     else
         note "only kernel threads remain (RETIRED mode removes them)"
     fi
@@ -84,25 +113,30 @@ fi
 echo
 echo "--- IRQ delta over 3s ---"
 header=$(head -1 /proc/interrupts 2>/dev/null)
-if ! grep -q 'CPU2' <<<"$header" || ! grep -q 'CPU8' <<<"$header"; then
-    note "CPU2/8 offline; IRQ check skipped (offline is the strongest state)"
+irq_ok=1
+for cpu in $(fl_expand_cpus "$FAULT_CPUS"); do
+    grep -qE "(^|[[:space:]])CPU$cpu([[:space:]]|$)" <<<"$header" || irq_ok=0
+done
+if ((!online)) || ((!irq_ok)); then
+    note "faulty CPUs offline; IRQ check skipped (offline is the strongest state)"
 else
-    read -r irq_a irq_b < <(awk '
-        NR == 1 { for (i = 2; i <= NF; i++) { if ($i == "CPU2") c2 = i; if ($i == "CPU8") c8 = i } next }
-        /^ *[0-9]+:/ { s2 += $c2; s8 += $c8 }
-        END { printf "%d %d\n", s2, s8 }
-    ' /proc/interrupts)
+    irq_sum() {
+        awk -v list="$(fl_cpus_spaces "$FAULT_CPUS")" '
+            BEGIN { n = split(list, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+            NR == 1 { for (i = 2; i <= NF; i++)
+                          if ($i ~ /^CPU[0-9]+$/ && (substr($i, 4) + 0) in want) col[i] = 1
+                      next }
+            /^ *[0-9]+:/ { for (i in col) s += $i }
+            END { print s + 0 }' /proc/interrupts
+    }
+    before=$(irq_sum)
     sleep 3
-    read -r irq_a2 irq_b2 < <(awk '
-        NR == 1 { for (i = 2; i <= NF; i++) { if ($i == "CPU2") c2 = i; if ($i == "CPU8") c8 = i } next }
-        /^ *[0-9]+:/ { s2 += $c2; s8 += $c8 }
-        END { printf "%d %d\n", s2, s8 }
-    ' /proc/interrupts)
-    d2=$((irq_a2 - irq_a)); d8=$((irq_b2 - irq_b))
-    if [[ $d2 -eq 0 && $d8 -eq 0 ]]; then
-        ok "no interrupts on CPUs 2/8 in 3s"
+    after=$(irq_sum)
+    delta=$((after - before))
+    if [[ $delta -eq 0 ]]; then
+        ok "no interrupts on the faulty core in 3s"
     else
-        note "interrupt activity on core 2 (CPU2 +$d2, CPU8 +$d8); check IPIs/timers"
+        note "interrupt activity on the faulty core (+$delta); check IPIs/timers"
     fi
 fi
 

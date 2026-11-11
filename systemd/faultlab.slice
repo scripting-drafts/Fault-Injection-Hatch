@@ -1,5 +1,4 @@
 [Unit]
-Description=Fault lab slice: physical core 2 (CPUs 2,8)
+Description=Fault lab slice: work pinned to the faulty physical core
 
 [Slice]
-AllowedCPUs=2 8

@@ -4,9 +4,9 @@
 Sign on the faulty core, verify on a healthy core.  A single CRT fault can
 leak the private key (Bellcore attack); the verifier attempts the gcd recovery.
 
-  taskset -c 3,9 python3 crypto/fault_crypto_test.py keygen
+  taskset -c <control-cpus> python3 crypto/fault_crypto_test.py keygen
   sudo faultlab python3 crypto/fault_crypto_test.py sign --out /tmp/dfa.jsonl
-  taskset -c 3,9 python3 crypto/fault_crypto_test.py verify --in /tmp/dfa.jsonl
+  taskset -c <control-cpus> python3 crypto/fault_crypto_test.py verify --in /tmp/dfa.jsonl
 
 Throwaway test key only. Never point --key at a real key.
 """

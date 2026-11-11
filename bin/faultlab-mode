@@ -1,52 +1,57 @@
 #!/usr/bin/env bash
-# Switch between RETIRED (core offline) and LAB (core online, fenced) modes.
+# Switch between RETIRED (faulty core offline) and LAB (core online, fenced) modes.
 set -euo pipefail
-[[ $EUID -eq 0 ]] || { echo "faultlab-mode: run with sudo" >&2; exit 1; }
-[[ -d /etc/faultlab ]] || { echo "faultlab-mode: run apply.sh first" >&2; exit 1; }
 
-offline_cpu() {
-    local cpu=$1
-    [[ -e /sys/devices/system/cpu/cpu$cpu/online ]] || return 0
-    [[ $(</sys/devices/system/cpu/cpu$cpu/online) == 0 ]] && return 0
-    local i
-    for i in 1 2 3 4 5; do
-        echo 0 > "/sys/devices/system/cpu/cpu$cpu/online" 2>/dev/null && return 0
-        sleep 1
+conf=${FAULTLAB_CONF:-/etc/faultlab/config}
+if [[ -r $conf ]]; then
+    # shellcheck disable=SC1090
+    . "$conf"
+fi
+if [[ -z ${FAULTLAB_HOME:-} ]]; then
+    d=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    for candidate in "$d/.." /usr/local/lib/fault-injection-rig; do
+        if [[ -r $candidate/lib/faultlab-common.sh ]]; then
+            FAULTLAB_HOME=$(cd -- "$candidate" && pwd)
+            break
+        fi
     done
-    echo "warning: could not offline CPU$cpu (busy?)" >&2
-    return 1
-}
+fi
+[[ -n ${FAULTLAB_HOME:-} && -r $FAULTLAB_HOME/lib/faultlab-common.sh ]] ||
+    { echo "faultlab-mode: cannot locate lib; set FAULTLAB_HOME or run apply.sh" >&2; exit 1; }
+. "$FAULTLAB_HOME/lib/faultlab-common.sh"
 
-online_cpu() {
-    local cpu=$1
-    [[ -e /sys/devices/system/cpu/cpu$cpu/online ]] || return 0
-    local i
-    for i in 1 2 3; do
-        echo 1 > "/sys/devices/system/cpu/cpu$cpu/online" 2>/dev/null && return 0
-        sleep 1
-    done
-    echo "error: could not online CPU$cpu" >&2
-    return 1
-}
+case ${1:-status} in
+lab | retired)
+    [[ $EUID -eq 0 ]] || { echo "faultlab-mode: run with sudo" >&2; exit 1; }
+    [[ -d /etc/faultlab ]] || { echo "faultlab-mode: run apply.sh first" >&2; exit 1; }
+    ;;
+esac
+
+fl_load_topology
 
 case ${1:-status} in
 lab)
-    echo lab > /etc/faultlab/mode
-    online_cpu 2
-    online_cpu 8
+    echo lab >/etc/faultlab/mode
+    if ! fl_online_fault_cpus; then
+        echo "faultlab-mode: some faulty CPUs could not be brought online" >&2
+        exit 1
+    fi
     systemctl start faultlab.slice
-    echo "mode=lab: CPUs 2,8 online inside faultlab.slice"
+    echo "mode=lab: CPUs $FAULT_CPUS online inside faultlab.slice"
     ;;
 retired)
-    echo retired > /etc/faultlab/mode
-    offline_cpu 8 || true
-    offline_cpu 2 || true
-    echo "mode=retired: CPUs 2,8 offlined"
+    echo retired >/etc/faultlab/mode
+    fl_offline_fault_cpus || true
+    echo "mode=retired: CPUs $FAULT_CPUS offlined"
     ;;
 status)
     printf 'mode:          %s\n' "$(cat /etc/faultlab/mode 2>/dev/null || echo unset)"
-    printf 'cpu2 online:   %s\n' "$(cat /sys/devices/system/cpu/cpu2/online 2>/dev/null || echo n/a)"
-    printf 'cpu8 online:   %s\n' "$(cat /sys/devices/system/cpu/cpu8/online 2>/dev/null || echo n/a)"
+    printf 'fault cpu:     %s (core CPUs %s)\n' "$FAULT_CPU" "$FAULT_CPUS"
+    printf 'control cpu:   %s (core CPUs %s)\n' "$CONTROL_CPU" "$CONTROL_CPUS"
+    for cpu in $(fl_expand_cpus "$FAULT_CPUS" | sort -n); do
+        printf 'cpu%-11s %s\n' "$cpu online:" \
+            "$(cat "/sys/devices/system/cpu/cpu$cpu/online" 2>/dev/null || echo 1)"
+    done
     printf 'isolated:      %s\n' "$(cat /sys/devices/system/cpu/isolated 2>/dev/null)"
     printf 'nohz_full:     %s\n' "$(cat /sys/devices/system/cpu/nohz_full 2>/dev/null)"
     printf 'system.slice:  %s\n' "$(cat /sys/fs/cgroup/system.slice/cpuset.cpus.effective 2>/dev/null)"

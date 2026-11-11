@@ -1,56 +1,96 @@
 #!/usr/bin/env bash
-# Phase 1: characterise core 2. Requires lab mode.
+# Phase 1: characterise the faulty core against a healthy control core.
 set -uo pipefail
-[[ $EUID -eq 0 ]] || { echo "faultlab-classify: run with sudo" >&2; exit 1; }
-self=$(readlink -f "${BASH_SOURCE[0]}")
-home=${FAULTLAB_HOME:-$(cd -- "$(dirname -- "$self")/.." && pwd)}
-fl=$home/bin/faultlab
-[[ -x $fl ]] || fl=/usr/local/sbin/faultlab
-duration=${1:-300}
-log=$home/sessions.log
 
-if [[ $(cat /sys/devices/system/cpu/cpu2/online 2>/dev/null) != 1 ]]; then
-    echo "core 2 is offline; run: sudo faultlab-mode lab" >&2
+conf=${FAULTLAB_CONF:-/etc/faultlab/config}
+if [[ -r $conf ]]; then
+    # shellcheck disable=SC1090
+    . "$conf"
+fi
+if [[ -z ${FAULTLAB_HOME:-} ]]; then
+    d=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    for candidate in "$d/.." /usr/local/lib/fault-injection-rig; do
+        if [[ -r $candidate/lib/faultlab-common.sh ]]; then
+            FAULTLAB_HOME=$(cd -- "$candidate" && pwd)
+            break
+        fi
+    done
+fi
+[[ -n ${FAULTLAB_HOME:-} && -r $FAULTLAB_HOME/lib/faultlab-common.sh ]] ||
+    { echo "faultlab-classify: cannot locate lib; set FAULTLAB_HOME or run apply.sh" >&2; exit 1; }
+. "$FAULTLAB_HOME/lib/faultlab-common.sh"
+
+if [[ $EUID -ne 0 ]]; then
+    echo "faultlab-classify: run with sudo" >&2
+    exit 1
+fi
+fl_load_topology
+
+fl=$FAULTLAB_HOME/bin/faultlab
+[[ -x $fl ]] || fl=$(command -v faultlab || true)
+[[ -n $fl ]] || { echo "faultlab-classify: faultlab wrapper not found" >&2; exit 1; }
+command -v stress-ng >/dev/null 2>&1 ||
+    { echo "faultlab-classify: stress-ng is required" >&2; exit 1; }
+duration=${1:-300}
+workers=$(fl_cpu_count "$FAULT_CPUS")
+log=${FAULTLAB_SESSION_LOG:-/var/log/faultlab/sessions.log}
+mkdir -p -- "$(dirname -- "$log")" 2>/dev/null || true
+[[ -w $(dirname -- "$log") ]] || log=$FAULTLAB_HOME/sessions.log
+
+if ! fl_fault_cpus_online; then
+    echo "faulty CPUs ($FAULT_CPUS) are offline; run: sudo faultlab-mode lab" >&2
     exit 1
 fi
 
 {
     echo
-    echo "=== session $(date -Is) duration=${duration}s ==="
+    echo "=== session $(date -Is) duration=${duration}s faulty=${FAULT_CPUS} control=${CONTROL_CPUS} ==="
     grep -m1 microcode /proc/cpuinfo
     cat /proc/cmdline
 } | tee -a "$log"
 
 echo "== RAS baseline ==" | tee -a "$log"
-ras-mc-ctl --summary 2>&1 | tee -a "$log"
-ras-mc-ctl --errors 2>&1 | tee -a "$log"
+if command -v ras-mc-ctl >/dev/null 2>&1; then
+    ras-mc-ctl --summary 2>&1 | tee -a "$log"
+    ras-mc-ctl --errors 2>&1 | tee -a "$log"
+else
+    echo "ras-mc-ctl not installed; skipping RAS baseline" | tee -a "$log"
+fi
 
-tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 (
     while :; do
-        sensors 2>/dev/null | awk '/Tctl|Tdie|Package id 0/{printf "%s %s %s\n", strftime("%H:%M:%S"), $1, $2}'
+        if command -v sensors >/dev/null 2>&1; then
+            sensors 2>/dev/null | awk '/Tctl|Tdie|Package id 0/{printf "%s %s %s\n", strftime("%H:%M:%S"), $1, $2}'
+        fi
         sleep 10
     done
 ) >"$tmp/temps" &
 mon=$!
 
 echo "== load soak on faulty core (${duration}s) ==" | tee -a "$log"
-$fl stress-ng --cpu 2 --cpu-method all --timeout "$duration" --metrics-brief 2>&1 | tee -a "$log"
+"$fl" stress-ng --cpu "$workers" --cpu-method all --timeout "$duration" --metrics-brief 2>&1 | tee -a "$log"
 echo "== load soak on control core (${duration}s) ==" | tee -a "$log"
-taskset -c 3,9 stress-ng --cpu 2 --cpu-method all --timeout "$duration" --metrics-brief 2>&1 | tee -a "$log"
-kill "$mon" 2>/dev/null; wait "$mon" 2>/dev/null
+taskset -c "$CONTROL_CPUS" stress-ng --cpu "$workers" --cpu-method all --timeout "$duration" --metrics-brief 2>&1 | tee -a "$log"
+kill "$mon" 2>/dev/null
+wait "$mon" 2>/dev/null
 
 echo "== peak temperatures ==" | tee -a "$log"
 sort -k3 "$tmp/temps" 2>/dev/null | tail -5 | tee -a "$log"
 
 echo "== RAS after ==" | tee -a "$log"
-ras-mc-ctl --summary 2>&1 | tee -a "$log"
-ras-mc-ctl --errors 2>&1 | tee -a "$log"
-journalctl -k --since '-2 hours' 2>/dev/null |
-    grep -iE 'machine check|mce:|hardware error' | tail -20 | tee -a "$log"
+if command -v ras-mc-ctl >/dev/null 2>&1; then
+    ras-mc-ctl --summary 2>&1 | tee -a "$log"
+    ras-mc-ctl --errors 2>&1 | tee -a "$log"
+fi
+if command -v journalctl >/dev/null 2>&1; then
+    journalctl -k --since '-2 hours' 2>/dev/null |
+        grep -iE 'machine check|mce:|hardware error' | tail -20 | tee -a "$log"
+fi
 
 echo "== determinism A/B (silent corruption probe) ==" | tee -a "$log"
-$home/bin/faultlab-ab --runs 3 -- python3 "$home/tools/sdc_probe.py" 2>&1 | tee -a "$log"
+"$FAULTLAB_HOME/bin/faultlab-ab" --runs 3 -- python3 "$FAULTLAB_HOME/tools/sdc_probe.py" 2>&1 | tee -a "$log"
 rc=${PIPESTATUS[0]}
 
 echo "== done; A/B exit=$rc. Log: $log ==" | tee -a "$log"

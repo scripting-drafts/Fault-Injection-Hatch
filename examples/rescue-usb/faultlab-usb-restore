@@ -1,0 +1,90 @@
+#!/bin/bash
+# Undo faultlab boot changes and continue booting. Runs as PID 1 when the
+# rescue USB entry passes init=/usr/local/sbin/faultlab-usb-restore.
+# Manual use from a root shell: faultlab-usb-restore --no-exec
+set -uo pipefail
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+LOG=/var/log/faultlab-usb-restore.log
+NO_EXEC=0
+[[ ${1:-} == --no-exec ]] && NO_EXEC=1
+
+mkdir -p /var/log 2>/dev/null || true
+: >>"$LOG" 2>/dev/null || LOG=/dev/console
+
+log() {
+    printf '%s faultlab-usb-restore: %s\n' "$(date -Is)" "$*" >>"$LOG" 2>/dev/null || true
+    printf 'faultlab-usb-restore: %s\n' "$*" >/dev/console 2>/dev/null || true
+}
+
+# The initramfs normally moves these mounts into the new root; recreate any
+# that are missing before update-grub needs them.
+mountpoint -q /proc || mount -t proc proc /proc 2>/dev/null || true
+mountpoint -q /sys || mount -t sysfs sysfs /sys 2>/dev/null || true
+mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mount -o remount,rw / 2>/dev/null || true
+
+log "starting (pid $$)"
+
+restored=0
+backup=""
+for candidate in /etc/default/grub.faultlab.[0-9]*; do
+    [[ -f $candidate ]] || continue
+    backup=$candidate
+done
+if [[ -n $backup && -f $backup ]]; then
+    cp -a "$backup" /etc/default/grub && restored=1
+    log "restored $backup -> /etc/default/grub"
+fi
+
+if ((!restored)) && [[ -f /etc/default/grub ]]; then
+    cp -a /etc/default/grub /etc/default/grub.faultlab-usb-before
+    sed -i -E \
+        -e 's/[[:space:]]+(isolcpus|nohz_full|rcu_nocbs|irqaffinity)=[^"[:space:]]*//g' \
+        -e 's/"(isolcpus|nohz_full|rcu_nocbs|irqaffinity)=[^"[:space:]]*[[:space:]]*/"/g' \
+        -e 's/(GRUB_CMDLINE_LINUX_DEFAULT=")[[:space:]]+/\1/' \
+        -e 's/[[:space:]]+"/"/' \
+        /etc/default/grub
+    log "no backup found; stripped faultlab parameters from /etc/default/grub"
+fi
+
+rm -f /etc/systemd/system/faultlab.slice \
+    /etc/systemd/system/faultlab-retire.service \
+    /etc/systemd/system/faultlab.slice.d/50-faultlab-cpus.conf \
+    /etc/systemd/system/system.slice.d/50-faultlab-allowedcpus.conf \
+    /etc/systemd/system/user.slice.d/50-faultlab-allowedcpus.conf
+rmdir /etc/systemd/system/faultlab.slice.d 2>/dev/null || true
+rm -f /etc/faultlab/mode /etc/faultlab/config
+rmdir /etc/faultlab 2>/dev/null || true
+
+# Remove the rig, but keep this recovery entrypoint available for future boots.
+for name in faultlab faultlab-ab faultlab-classify faultlab-crypto \
+    faultlab-mode faultlab-retire faultlab-verify faultlab-watch; do
+    rm -f "/usr/local/sbin/$name"
+done
+rm -rf /usr/local/lib/fault-injection-rig
+
+if command -v update-grub >/dev/null 2>&1; then
+    update-grub >>"$LOG" 2>&1 || log "update-grub failed; see $LOG"
+elif command -v grub-mkconfig >/dev/null 2>&1; then
+    grub-mkconfig -o /boot/grub/grub.cfg >>"$LOG" 2>&1 ||
+        log "grub-mkconfig failed; see $LOG"
+else
+    log "no grub generator found; patching grub.cfg directly"
+fi
+
+# Belt and suspenders: never leave faultlab parameters in the generated file.
+if [[ -f /boot/grub/grub.cfg ]]; then
+    sed -i -E 's/[[:space:]]+(isolcpus|nohz_full|rcu_nocbs|irqaffinity)=[^[:space:]"]*//g' \
+        /boot/grub/grub.cfg
+    log "stripped faultlab parameters from /boot/grub/grub.cfg"
+fi
+
+sync
+log "restore complete"
+
+if ((NO_EXEC)); then
+    exit 0
+fi
+log "continuing boot with /sbin/init"
+exec /sbin/init

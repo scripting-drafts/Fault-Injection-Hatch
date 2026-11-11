@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Offline every CPU of the configured faulty physical core (RETIRED mode).
+set -uo pipefail
+
+conf=${FAULTLAB_CONF:-/etc/faultlab/config}
+if [[ -r $conf ]]; then
+    # shellcheck disable=SC1090
+    . "$conf"
+fi
+if [[ -z ${FAULTLAB_HOME:-} ]]; then
+    d=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    for candidate in "$d/.." /usr/local/lib/fault-injection-rig; do
+        if [[ -r $candidate/lib/faultlab-common.sh ]]; then
+            FAULTLAB_HOME=$(cd -- "$candidate" && pwd)
+            break
+        fi
+    done
+fi
+[[ -n ${FAULTLAB_HOME:-} && -r $FAULTLAB_HOME/lib/faultlab-common.sh ]] ||
+    { echo "faultlab-retire: cannot locate lib" >&2; exit 1; }
+. "$FAULTLAB_HOME/lib/faultlab-common.sh"
+
+[[ $EUID -eq 0 ]] || { echo "faultlab-retire: root required" >&2; exit 1; }
+fl_load_topology
+fl_offline_fault_cpus

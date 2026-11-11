@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
-# Run a command pinned to physical core 2 (CPUs 2,8) inside faultlab.slice.
+# Run a command pinned to the configured faulty physical core.
 set -euo pipefail
+
+conf=${FAULTLAB_CONF:-/etc/faultlab/config}
+if [[ -r $conf ]]; then
+    # shellcheck disable=SC1090
+    . "$conf"
+fi
+if [[ -z ${FAULTLAB_HOME:-} ]]; then
+    d=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    for candidate in "$d/.." /usr/local/lib/fault-injection-rig; do
+        if [[ -r $candidate/lib/faultlab-common.sh ]]; then
+            FAULTLAB_HOME=$(cd -- "$candidate" && pwd)
+            break
+        fi
+    done
+fi
+[[ -n ${FAULTLAB_HOME:-} && -r $FAULTLAB_HOME/lib/faultlab-common.sh ]] ||
+    { echo "faultlab: cannot locate lib; set FAULTLAB_HOME or run apply.sh" >&2; exit 1; }
+. "$FAULTLAB_HOME/lib/faultlab-common.sh"
 
 if [[ $EUID -ne 0 ]]; then
     echo "faultlab: root required; the faulty core is fenced from normal users." >&2
@@ -8,9 +26,9 @@ if [[ $EUID -ne 0 ]]; then
 fi
 [[ $# -gt 0 ]] || { echo "usage: faultlab CMD [ARGS...]" >&2; exit 2; }
 
-online=/sys/devices/system/cpu/cpu2/online
-if [[ ! -e $online || $(<"$online") != 1 || $(</sys/devices/system/cpu/cpu8/online) != 1 ]]; then
-    echo "faultlab: CPUs 2/8 are offline. Enable the lab first: sudo faultlab-mode lab" >&2
+fl_load_topology
+if ! fl_fault_cpus_online; then
+    echo "faultlab: faulty CPUs ($FAULT_CPUS) are offline. Enable the lab first: sudo faultlab-mode lab" >&2
     exit 1
 fi
 
@@ -18,7 +36,7 @@ systemctl start faultlab.slice
 
 args=(--quiet --collect --unit="faultlab-$$-$(date +%s)"
       --slice=faultlab.slice
-      --property=CPUAffinity="2 8"
+      --property=CPUAffinity="$(fl_cpus_spaces "$FAULT_CPUS")"
       --property=WorkingDirectory="$PWD"
       --setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)
 
