@@ -22,6 +22,21 @@ fi
 
 fl_load_topology
 
+mode=$(cat /etc/faultlab/mode 2>/dev/null || true)
+mode=${mode:-unset}
+all_offline=1
+any_online=0
+for cpu in $(fl_expand_cpus "$FAULT_CPUS"); do
+    if [[ -e /sys/devices/system/cpu/cpu$cpu/online ]]; then
+        state=$(cat "/sys/devices/system/cpu/cpu$cpu/online" 2>/dev/null || echo 1)
+        if [[ $state == 0 ]]; then
+            continue
+        fi
+        any_online=1
+    fi
+    all_offline=0
+done
+
 pass=0
 warn=0
 fail=0
@@ -31,6 +46,7 @@ bad() { printf 'FAIL  %s\n' "$*"; fail=$((fail + 1)); }
 readfile() { cat "$1" 2>/dev/null || true; }
 
 cmdline=$(readfile /proc/cmdline)
+echo "mode: $mode"
 echo "cmdline: $cmdline"
 echo "faulty core: CPUs $FAULT_CPUS; control core: CPUs $CONTROL_CPUS"
 for token in isolcpus nohz_full rcu_nocbs irqaffinity; do
@@ -40,6 +56,11 @@ done
 isolated=$(readfile /sys/devices/system/cpu/isolated)
 nohz=$(readfile /sys/devices/system/cpu/nohz_full)
 for cpu in $(fl_expand_cpus "$FAULT_CPUS"); do
+    state=$(readfile "/sys/devices/system/cpu/cpu$cpu/online")
+    if [[ -e /sys/devices/system/cpu/cpu$cpu/online && $state == 0 ]]; then
+        ok "CPU$cpu offline (retired; strongest state)"
+        continue
+    fi
     fl_list_has "$isolated" "$cpu" && ok "CPU$cpu isolated" || bad "CPU$cpu not isolated"
     fl_list_has "$nohz" "$cpu" && ok "CPU$cpu in nohz_full" || bad "CPU$cpu not in nohz_full"
 done
@@ -68,19 +89,17 @@ missing=""
 for cpu in $(fl_expand_cpus "$FAULT_CPUS"); do
     fl_list_has "$lab" "$cpu" || missing="$missing $cpu"
 done
-if [[ -n $lab && -z $missing ]]; then
+if ((all_offline)); then
+    ok "faulty core offline; faultlab.slice not required"
+elif [[ -n $lab && -z $missing ]]; then
     ok "faultlab.slice holds the faulty core ('$lab')"
 else
     note "faultlab.slice not configured or not started ('$lab'; missing:${missing:- none})"
 fi
 
-online=1
 for cpu in $(fl_expand_cpus "$FAULT_CPUS"); do
     state=$(readfile "/sys/devices/system/cpu/cpu$cpu/online")
     [[ -n $state ]] && echo "CPU$cpu online=$state"
-    if [[ -e /sys/devices/system/cpu/cpu$cpu/online && $state == 0 ]]; then
-        online=0
-    fi
 done
 for cpu in $(fl_expand_cpus "$CONTROL_CPUS"); do
     state=$(readfile "/sys/devices/system/cpu/cpu$cpu/online")
@@ -89,24 +108,28 @@ done
 
 echo
 echo "--- tasks sampled on faulty CPUs ---"
-tasks=$(ps -eLo psr=,pid=,comm= 2>/dev/null | awk -v list="$(fl_cpus_spaces "$FAULT_CPUS")" '
-    BEGIN { n = split(list, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
-    want[$1] { print }')
-if [[ -z $tasks ]]; then
-    ok "no tasks on the faulty core"
+if ((all_offline)); then
+    ok "faulty core offline; no tasks can run there"
 else
-    user_tasks=$(while read -r psr pid comm; do
-        if [[ -s /proc/$pid/cmdline ]]; then
-            printf '%s %s %s\n' "$psr" "$pid" "$comm"
-        fi
-    done <<<"$tasks")
-    if [[ -n $user_tasks ]]; then
-        count=$(wc -l <<<"$user_tasks")
-        head -10 <<<"$user_tasks"
-        [[ $count -gt 10 ]] && echo "... ($count user tasks total)"
-        bad "$count user tasks found on the faulty core"
+    tasks=$(ps -eLo psr=,pid=,comm= 2>/dev/null | awk -v list="$(fl_cpus_spaces "$FAULT_CPUS")" '
+        BEGIN { n = split(list, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+        want[$1] { print }')
+    if [[ -z $tasks ]]; then
+        ok "no tasks on the faulty core"
     else
-        note "only kernel threads remain (RETIRED mode removes them)"
+        user_tasks=$(while read -r psr pid comm; do
+            if [[ -s /proc/$pid/cmdline ]]; then
+                printf '%s %s %s\n' "$psr" "$pid" "$comm"
+            fi
+        done <<<"$tasks")
+        if [[ -n $user_tasks ]]; then
+            count=$(wc -l <<<"$user_tasks")
+            head -10 <<<"$user_tasks"
+            [[ $count -gt 10 ]] && echo "... ($count user tasks total)"
+            bad "$count user tasks found on the faulty core"
+        else
+            note "only kernel threads remain (RETIRED mode removes them)"
+        fi
     fi
 fi
 
@@ -117,8 +140,10 @@ irq_ok=1
 for cpu in $(fl_expand_cpus "$FAULT_CPUS"); do
     grep -qE "(^|[[:space:]])CPU$cpu([[:space:]]|$)" <<<"$header" || irq_ok=0
 done
-if ((!online)) || ((!irq_ok)); then
-    note "faulty CPUs offline; IRQ check skipped (offline is the strongest state)"
+if ((all_offline)); then
+    ok "faulty core offline; IRQs cannot run there"
+elif ((!irq_ok)); then
+    note "faulty CPUs missing from /proc/interrupts; IRQ check skipped"
 else
     irq_sum() {
         awk -v list="$(fl_cpus_spaces "$FAULT_CPUS")" '
@@ -138,6 +163,12 @@ else
     else
         note "interrupt activity on the faulty core (+$delta); check IPIs/timers"
     fi
+fi
+
+if [[ $mode == lab && $all_offline -eq 1 ]]; then
+    bad "mode=lab but all faulty CPUs are offline"
+elif [[ $mode == retired && $any_online -eq 1 ]]; then
+    bad "mode=retired but a hotpluggable faulty CPU is online"
 fi
 
 echo

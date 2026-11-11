@@ -79,13 +79,24 @@ fl_cpu_attr() { # CPU ATTR
 }
 
 # Sibling threads of a logical CPU (a physical core can expose several).
+# If the CPU is offline its topology file can disappear; try to find the
+# sibling set from any online CPU before falling back to the CPU alone.
 fl_siblings() {
     local cpu=$1 f=/sys/devices/system/cpu/cpu$1/topology/thread_siblings_list
+    local other list
     if [[ -r $f ]]; then
         fl_normalize_cpus "$(<"$f")"
-    else
-        printf '%s\n' "$cpu"
+        return 0
     fi
+    for other in /sys/devices/system/cpu/cpu*/topology/thread_siblings_list; do
+        [[ -r $other ]] || continue
+        list=$(<"$other")
+        if fl_list_has "$list" "$cpu"; then
+            fl_normalize_cpus "$list"
+            return 0
+        fi
+    done
+    printf '%s\n' "$cpu"
 }
 
 # Complement of EXCLUDE among possible CPUs.
@@ -136,11 +147,25 @@ fl_load_topology() {
     [[ -n ${FAULT_CPU:-} ]] ||
         fl_die "FAULT_CPU is not configured; run apply.sh or set it in $FAULTLAB_CONF"
     fl_cpu_exists "$FAULT_CPU" || fl_die "FAULT_CPU=$FAULT_CPU does not exist"
+    local configured_fault=${FAULT_CPUS:-}
+    local configured_control=${CONTROL_CPUS:-}
+    local fault_topology=/sys/devices/system/cpu/cpu$FAULT_CPU/topology/thread_siblings_list
     FAULT_CPUS=$(fl_siblings "$FAULT_CPU")
+    # Offline CPUs lose their topology directory. Trust the install-time list
+    # when the seed CPU has no topology file of its own.
+    if [[ ! -r $fault_topology && -n $configured_fault ]] &&
+        fl_list_has "$configured_fault" "$FAULT_CPU"; then
+        FAULT_CPUS=$(fl_normalize_cpus "$configured_fault")
+    fi
 
     if [[ -n ${CONTROL_CPU:-} ]]; then
         if fl_cpu_exists "$CONTROL_CPU"; then
             CONTROL_CPUS=$(fl_siblings "$CONTROL_CPU")
+            if [[ ! -r /sys/devices/system/cpu/cpu$CONTROL_CPU/topology/thread_siblings_list &&
+                -n $configured_control ]] &&
+                fl_list_has "$configured_control" "$CONTROL_CPU"; then
+                CONTROL_CPUS=$(fl_normalize_cpus "$configured_control")
+            fi
         else
             fl_warn "CONTROL_CPU=$CONTROL_CPU does not exist; auto-selecting one"
             CONTROL_CPU=""
