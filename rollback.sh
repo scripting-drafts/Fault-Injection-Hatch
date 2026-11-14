@@ -37,23 +37,50 @@ fi
 
 systemctl daemon-reload
 
+# Prefer the newest clean pre-faultlab backup. Older installs could leave the
+# newest backup already containing faultlab parameters, so strip any remaining
+# tokens unconditionally before regenerating GRUB.
 backup=""
+clean_backup=""
 for candidate in /etc/default/grub.faultlab.[0-9]*; do
     [[ -f $candidate ]] || continue
     backup=$candidate
-done
-if [[ -n $backup ]]; then
-    cp -a "$backup" /etc/default/grub
-    echo "restored: $backup"
-    if command -v update-grub >/dev/null 2>&1; then
-        update-grub
-    elif command -v grub-mkconfig >/dev/null 2>&1; then
-        grub-mkconfig -o /boot/grub/grub.cfg
-    else
-        echo "rollback: regenerate grub manually" >&2
+    if ! grep -qE '(^|[[:space:]])(isolcpus|nohz_full|rcu_nocbs|irqaffinity)=' "$candidate"; then
+        clean_backup=$candidate
     fi
+done
+restore=${clean_backup:-$backup}
+if [[ -n $restore ]]; then
+    cp -a "$restore" /etc/default/grub
+    echo "restored: $restore"
+elif [[ -f /etc/default/grub ]]; then
+    cp -a /etc/default/grub /etc/default/grub.faultlab-rollback-before
+    echo "rollback: no grub backup found; stripping faultlab parameters"
 else
-    echo "rollback: no grub backup found; check /etc/default/grub manually" >&2
+    echo "rollback: /etc/default/grub not found" >&2
+fi
+
+if [[ -f /etc/default/grub ]]; then
+    sed -i -E \
+        -e 's/[[:space:]]+(isolcpus|nohz_full|rcu_nocbs|irqaffinity)=[^"[:space:]]*//g' \
+        -e 's/"(isolcpus|nohz_full|rcu_nocbs|irqaffinity)=[^"[:space:]]*[[:space:]]*/"/g' \
+        -e 's/(GRUB_CMDLINE_LINUX_DEFAULT=")[[:space:]]+/\1/' \
+        -e 's/[[:space:]]+"/"/' \
+        /etc/default/grub
+fi
+
+if command -v update-grub >/dev/null 2>&1; then
+    update-grub
+elif command -v grub-mkconfig >/dev/null 2>&1; then
+    grub-mkconfig -o /boot/grub/grub.cfg
+else
+    echo "rollback: regenerate grub manually" >&2
+fi
+
+# Final defense: never leave faultlab parameters in the generated GRUB config.
+if [[ -f /boot/grub/grub.cfg ]]; then
+    sed -i -E 's/[[:space:]]+(isolcpus|nohz_full|rcu_nocbs|irqaffinity)=[^[:space:]"]*//g' \
+        /boot/grub/grub.cfg
 fi
 
 rm -f /etc/faultlab/mode "$conf"

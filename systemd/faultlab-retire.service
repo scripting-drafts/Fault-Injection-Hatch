@@ -1,14 +1,14 @@
 [Unit]
-Description=Retire the faulty physical core
+Description=Retire the faulty physical core at boot (LAB is session-only)
 Documentation=https://github.com/scripting-drafts/Fault-Injection-Hatch#readme
 After=sysinit.target
-ConditionPathExists=/etc/faultlab/mode
+Before=systemd-user-sessions.service
+ConditionPathExists=/etc/faultlab/config
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecCondition=/bin/sh -c 'grep -qx retired /etc/faultlab/mode'
-ExecStart=/usr/local/sbin/faultlab-retire
+ExecStart=/usr/local/sbin/faultlab-mode retired
 
 [Install]
 WantedBy=multi-user.target

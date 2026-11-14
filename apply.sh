@@ -86,7 +86,7 @@ safe_spaces=$(fl_cpus_spaces "$SAFE_CPUS")
 if ((dry_run)); then
     echo "dry run: no changes will be made"
     fl_print_topology
-    echo "grub: isolcpus=managed_irq,$FAULT_CPUS nohz_full=$FAULT_CPUS rcu_nocbs=$FAULT_CPUS irqaffinity=$SAFE_CPUS"
+    echo "grub: isolcpus=domain,managed_irq,$FAULT_CPUS nohz_full=$FAULT_CPUS rcu_nocbs=$FAULT_CPUS irqaffinity=$SAFE_CPUS"
     echo
     echo "--- /etc/systemd/system/faultlab.slice.d/50-faultlab-cpus.conf"
     printf '[Slice]\nAllowedCPUs=%s\n' "$fault_spaces"
@@ -109,17 +109,24 @@ install -m 0755 -o root -g root "$here/bin/faultlab-usb-restore" /usr/local/sbin
 
 fl_print_topology
 
-backup=/etc/default/grub.faultlab.$(date +%Y%m%d-%H%M%S)
-cp -a /etc/default/grub "$backup"
-echo "grub backup: $backup"
+# Keep the first clean pre-faultlab backup. Re-runs and upgrades must not
+# replace it with an already-modified file.
+if ! grep -qE '(^|[[:space:]])(isolcpus|nohz_full|rcu_nocbs|irqaffinity)=' /etc/default/grub; then
+    backup=/etc/default/grub.faultlab.$(date +%Y%m%d-%H%M%S)
+    cp -a /etc/default/grub "$backup"
+    echo "grub backup: $backup"
+fi
 
-params=("isolcpus=managed_irq,$FAULT_CPUS" "nohz_full=$FAULT_CPUS" "rcu_nocbs=$FAULT_CPUS" "irqaffinity=$SAFE_CPUS")
+params=("isolcpus=domain,managed_irq,$FAULT_CPUS" "nohz_full=$FAULT_CPUS" "rcu_nocbs=$FAULT_CPUS" "irqaffinity=$SAFE_CPUS")
 param_line="${params[*]}"
 
 python3 - "$param_line" <<'PY'
 import re, sys
 path = "/etc/default/grub"
 params = sys.argv[1]
+# Older faultlab installs omitted the scheduler-domain flag. Accept that exact
+# line as an in-place upgrade; anything else is still treated as foreign.
+legacy = params.replace("isolcpus=domain,", "isolcpus=", 1)
 text = open(path).read()
 match = re.search(r'(?m)^GRUB_CMDLINE_LINUX_DEFAULT="([^"]*)"', text)
 if match:
@@ -127,6 +134,11 @@ if match:
     if "isolcpus=" in current or "nohz_full=" in current:
         if params in current:
             print("grub: faultlab parameters already present, leaving file unchanged")
+        elif legacy in current:
+            value = current.replace(legacy, params, 1)
+            text = text[:match.start(1)] + value + text[match.end(1):]
+            open(path, "w").write(text)
+            print("grub: upgraded faultlab parameters (added domain isolation)")
         else:
             sys.exit("grub: existing isolation parameters differ; run rollback.sh before changing the faulty core")
     else:
@@ -196,10 +208,16 @@ SAFE_CPUS=$SAFE_CPUS
 EOF
 chmod 0644 /etc/faultlab/config
 
-echo retired >/etc/faultlab/mode
+# First install starts in RETIRED. Re-runs preserve the live session; the boot
+# service always retires on the next boot.
+if [[ ! -e /etc/faultlab/mode ]]; then
+    echo retired >/etc/faultlab/mode
+fi
 systemctl daemon-reload
 systemctl enable faultlab-retire.service
 
 echo
-echo "installed. Reboot to activate isolcpus/nohz_full/rcu_nocbs/irqaffinity."
+echo "installed. Reboot to activate domain isolation and the boot-time retire policy."
+echo "LAB is session-only: after reboot run 'sudo faultlab-mode lab' for each session."
+printf 'current session mode: %s; next boot: retired\n' "$(cat /etc/faultlab/mode 2>/dev/null || echo unset)"
 echo "After reboot: sudo faultlab-mode status && sudo faultlab-verify"

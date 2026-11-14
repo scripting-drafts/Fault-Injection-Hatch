@@ -37,15 +37,23 @@ lab)
         exit 1
     fi
     systemctl start faultlab.slice
-    echo "mode=lab: CPUs $FAULT_CPUS online inside faultlab.slice"
+    echo "mode=lab: CPUs $FAULT_CPUS online inside faultlab.slice (session only)"
     ;;
 retired)
     echo retired >/etc/faultlab/mode
-    fl_offline_fault_cpus || true
-    echo "mode=retired: CPUs $FAULT_CPUS offlined"
+    # Stop any lab workload before taking its CPUs offline.
+    systemctl stop faultlab.slice 2>/dev/null || true
+    if ! fl_offline_fault_cpus; then
+        echo "faultlab-mode: some faulty CPUs could not be offlined" >&2
+        exit 1
+    fi
+    echo "mode=retired: CPUs $FAULT_CPUS offlined (LAB session ended)"
     ;;
 status)
-    printf 'mode:          %s\n' "$(cat /etc/faultlab/mode 2>/dev/null || echo unset)"
+    mode=$(cat /etc/faultlab/mode 2>/dev/null || echo unset)
+    slice=$(cat /sys/fs/cgroup/faultlab.slice/cpuset.cpus.effective 2>/dev/null || true)
+    printf 'mode:          %s\n' "$mode"
+    printf 'boot policy:   retired (LAB is session-only)\n'
     printf 'fault cpu:     %s (core CPUs %s)\n' "$FAULT_CPU" "$FAULT_CPUS"
     printf 'control cpu:   %s (core CPUs %s)\n' "$CONTROL_CPU" "$CONTROL_CPUS"
     for cpu in $(fl_expand_cpus "$FAULT_CPUS" | sort -n); do
@@ -56,7 +64,15 @@ status)
     printf 'nohz_full:     %s\n' "$(cat /sys/devices/system/cpu/nohz_full 2>/dev/null)"
     printf 'system.slice:  %s\n' "$(cat /sys/fs/cgroup/system.slice/cpuset.cpus.effective 2>/dev/null)"
     printf 'user.slice:    %s\n' "$(cat /sys/fs/cgroup/user.slice/cpuset.cpus.effective 2>/dev/null)"
-    printf 'faultlab.slice:%s\n' "$(cat /sys/fs/cgroup/faultlab.slice/cpuset.cpus.effective 2>/dev/null)"
+    if [[ -n $slice ]]; then
+        printf 'faultlab.slice: %s\n' "$slice"
+    elif [[ $mode == lab ]]; then
+        printf 'faultlab.slice: MISSING (mode=lab; run faultlab-mode lab)\n'
+    elif [[ $mode == retired ]]; then
+        printf 'faultlab.slice: not active (retired)\n'
+    else
+        printf 'faultlab.slice: not active (mode unset)\n'
+    fi
     ;;
 *)
     echo "usage: faultlab-mode {lab|retired|status}" >&2

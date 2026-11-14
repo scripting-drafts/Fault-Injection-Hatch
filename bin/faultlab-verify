@@ -93,6 +93,8 @@ if ((all_offline)); then
     ok "faulty core offline; faultlab.slice not required"
 elif [[ -n $lab && -z $missing ]]; then
     ok "faultlab.slice holds the faulty core ('$lab')"
+elif [[ $mode == lab ]]; then
+    bad "faultlab.slice not configured or not started ('$lab'; missing:${missing:- none})"
 else
     note "faultlab.slice not configured or not started ('$lab'; missing:${missing:- none})"
 fi

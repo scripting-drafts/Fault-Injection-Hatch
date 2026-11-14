@@ -25,19 +25,21 @@ Reference example used during development (values are illustrative):
 threads still run there. So the design has two modes:
 
 - **RETIRED (default):** every CPU on the faulty core is offlined at boot.
-  Nothing runs there.
-- **LAB (opt-in):** those CPUs are online, scheduler/IRQ/RCU isolation plus a
-  cgroup fence. Only `faultlab.slice` (root) can place work there.
+  The boot-time service always enforces this, regardless of the mode left by
+  the previous session. Nothing runs there.
+- **LAB (session-only):** those CPUs are online, scheduler/IRQ/RCU isolation
+  plus a cgroup fence. Only `faultlab.slice` (root) can place work there. LAB
+  is not restored by a reboot; re-run `faultlab-mode lab` for each session.
 
 ## 1. Layer model
 
 | Layer | Mechanism | What it stops |
 |---|---|---|
-| Scheduler | `isolcpus=managed_irq,${FAULT_CPUS}` | automatic user-task placement |
+| Scheduler | `isolcpus=domain,managed_irq,${FAULT_CPUS}` | automatic user-task placement |
 | Ticks / RCU | `nohz_full=${FAULT_CPUS}` `rcu_nocbs=${FAULT_CPUS}` | timer ticks, RCU callbacks |
 | Interrupts | `irqaffinity=${SAFE_CPUS}` | device IRQs |
 | Cgroup | `AllowedCPUs` on `system.slice`/`user.slice`; `faultlab.slice` = faulty CPUs | every service and login session |
-| Hotplug | `faultlab-retire.service` → `faultlab-retire` | everything, incl. per-CPU kthreads |
+| Hotplug | `faultlab-retire.service` → `faultlab-mode retired` | everything, incl. per-CPU kthreads |
 
 Kernel threads and PID 1 are not cgroup-fenceable; only RETIRED mode removes
 them from the faulty core.
@@ -75,11 +77,16 @@ Record every session in the session log: date, test, CE/UE before/after, max tem
 `sudo ./apply.sh --fault-cpu N [--control-cpu M]` (then reboot). It:
 
 - detects sibling threads and writes `/etc/faultlab/config`;
-- backs up `/etc/default/grub` and adds
-  `isolcpus=managed_irq,${FAULT_CPUS} nohz_full=${FAULT_CPUS} rcu_nocbs=${FAULT_CPUS} irqaffinity=${SAFE_CPUS}`;
+- backs up the first clean `/etc/default/grub` and adds
+  `isolcpus=domain,managed_irq,${FAULT_CPUS} nohz_full=${FAULT_CPUS} rcu_nocbs=${FAULT_CPUS} irqaffinity=${SAFE_CPUS}`;
 - installs `faultlab.slice` with an `AllowedCPUs=${FAULT_CPUS}` drop-in;
 - restricts `system.slice` and `user.slice` to `SAFE_CPUS`;
-- sets mode `retired`, enables `faultlab-retire.service`, installs the CLI tools.
+- sets mode `retired` on first install, enables `faultlab-retire.service`, and
+  installs the CLI tools.
+
+Re-running `apply.sh` upgrades the old `isolcpus=managed_irq,...` line in place
+and preserves the existing clean GRUB backup. The boot service always retires;
+LAB is session-only.
 
 Until the reboot, the cgroup fence is not active (the drop-ins only apply when
 the slices are next started), so a pre-reboot `lab` session is suitable for
@@ -96,9 +103,10 @@ Consequences to expect:
 
 `sudo faultlab-verify` checks: cmdline tokens, `isolated`/`nohz_full` sysfs,
 effective cpusets, online state, IRQ deltas on the faulty CPUs, control-core
-availability, and any task sampled there. Expected: IRQ delta 0 and no user
-tasks; per-CPU kthreads are reported separately and only disappear in RETIRED
-mode.
+availability, and any task sampled there. Expected: no user tasks and a
+configured `faultlab.slice` while `mode=lab`; per-CPU kthreads are reported
+separately and only disappear in RETIRED mode. Managed MSI-X queues can remain
+on the lab CPUs despite `irqaffinity`; these are reported as WARN.
 
 Also run `sudo faultlab-mode status`.
 
@@ -134,18 +142,20 @@ Also run `sudo faultlab-mode status`.
 
 ## 7. Rollback
 
-`sudo ./rollback.sh` restores the newest `/etc/default/grub.faultlab.*` backup,
-brings the faulty CPUs online, removes the units and drop-ins, and runs the
-GRUB generator. Then `sudo faultlab-mode retired` or reboot.
+`sudo ./rollback.sh` restores the newest clean `/etc/default/grub.faultlab.*`
+backup (or strips the faultlab tokens from the current file), brings the faulty
+CPUs online, removes the units and drop-ins, and regenerates `grub.cfg` without
+the isolation parameters. Then `sudo faultlab-mode retired` or reboot.
 
 ### Rescue USB
 
 A UEFI FAT32 USB can carry GRUB plus a modified initramfs whose `init-bottom`
-hook restores the newest GRUB backup, removes the faultlab units, regenerates
-`grub.cfg`, and then boots the installed system. The USB entry uses the
-installed kernel but its own initramfs, so it works even when the host
-initramfs is unusable. Rebuild it after a kernel or root-UUID change.
-`apply.sh` installs a host-side fallback at
+hook selects the newest clean GRUB backup (or strips the faultlab parameters
+from `/etc/default/grub`), removes the faultlab units, regenerates `grub.cfg`,
+strips the same parameters from `grub.cfg`, and then boots the installed system.
+The USB entry uses the installed kernel but its own initramfs, so it works even
+when the host initramfs is unusable. Rebuild it after a kernel, root-UUID, or
+rescue-hook change. `apply.sh` installs a host-side fallback at
 `/usr/local/sbin/faultlab-usb-restore`; `rollback.sh` leaves that file in place
 so the rescue USB entry keeps working.
 
@@ -154,11 +164,13 @@ so the rescue USB entry keeps working.
 `faultlab-ab` appends one JSON object per verdict to
 `/var/log/faultlab/ab.jsonl` (0640 root:adm). The record carries
 `faulty_cpus`/`control_cpus` from the live configuration, so consumers must not
-assume fixed CPU numbers. QA Sentinels consumes new lines from a persisted byte
-cursor and emits `ab.divergence` (critical), `ab.hw_suspect` and
-`ab.control_unstable` (warning). Each cycle it also checks the isolation policy
-and emits `retired.online`, `isolation.unfenced`, `isolation.missing`,
-`lab.*`, `irq.affinity` and `topology.*` events.
+assume fixed CPU numbers. QA Sentinels reads `/etc/faultlab/config`
+(`FAULT_CPUS`, `CONTROL_CPUS`) so it follows the configured core, consumes new
+lines from a persisted byte cursor, and emits `faultcore.ab.*` verdicts. A
+retired or offline core is captured as undetermined rather than absent; each
+cycle also checks the isolation policy and emits `faultcore.retired.online`,
+`faultcore.isolation.*`, `faultcore.lab.*`, `faultcore.irq.affinity` and
+`faultcore.topology.*` events.
 
 QA SIEM carries matching thresholds in `config/siem.rules.json`; apply them
 with `sudo scripts/sync-rules.sh` in the QA SIEM repository. MCE/EDAC events

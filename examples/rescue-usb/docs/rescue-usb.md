@@ -18,9 +18,10 @@ The USB contains:
 The menu loads the installed kernel from `/boot` but the **USB initramfs**.
 The hook runs before `switch_root` and, on the mounted root filesystem:
 
-1. restores the newest `/etc/default/grub.faultlab.[0-9]*` backup;
-2. if no backup exists, strips `isolcpus`, `nohz_full`, `rcu_nocbs` and
-   `irqaffinity` from `GRUB_CMDLINE_LINUX_DEFAULT`;
+1. selects the newest clean `/etc/default/grub.faultlab.[0-9]*` backup; if
+   every backup contains faultlab parameters, uses the newest and strips them;
+2. strips `isolcpus`, `nohz_full`, `rcu_nocbs` and `irqaffinity` from
+   `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`;
 3. removes the faultlab systemd units and cgroup drop-ins;
 4. removes the faultlab runtime configuration and installed tools;
 5. regenerates `grub.cfg` in a chroot, then strips the same parameters from
@@ -92,7 +93,7 @@ mount -t vfat /dev/sdX1 /mnt/usb
 
 The reference implementation was tested by booting the generated loader under
 QEMU/OVMF and by booting both generated initramfs variants against a disposable
-ext4 image containing a fake faultlab installation. The hook restored the GRUB
-backup, removed the units, ran the chrooted GRUB generator and stripped the
-kernel parameters from `grub.cfg`. Repeat that test on your own distribution
-before relying on the USB.
+ext4 image containing a fake faultlab installation. The hook selected the clean
+GRUB backup (or stripped the parameters), removed the units, ran the chrooted
+GRUB generator and stripped the kernel parameters from `/etc/default/grub` and
+`grub.cfg`. Repeat that test on your own distribution before relying on the USB.

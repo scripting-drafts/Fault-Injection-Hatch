@@ -5,6 +5,13 @@ set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 target=${1:-}
 
+# Keep the USB copy identical to the host-side recovery entrypoint.
+repo_restore=$here/../../bin/faultlab-usb-restore
+if [[ -f $repo_restore ]] && ! cmp -s "$here/faultlab-usb-restore" "$repo_restore"; then
+    echo "$0: examples/rescue-usb/faultlab-usb-restore differs from bin/faultlab-usb-restore" >&2
+    exit 1
+fi
+
 usage() {
     echo "usage: $0 MOUNTED_FAT32_DIRECTORY" >&2
     echo "  Builds EFI/BOOT/BOOTX64.EFI and faultlab/initrd-auto-<kernel>.img" >&2

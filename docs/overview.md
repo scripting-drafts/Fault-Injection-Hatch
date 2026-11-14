@@ -18,16 +18,16 @@ The project separates two operating modes:
 
 | Mode | Behaviour | Intended use |
 |---|---|---|
-| **RETIRED** (default) | Offlines logical CPUs 2 and 8 at boot | Keep the suspected physical core out of normal operation |
-| **LAB** (opt-in) | Brings CPUs 2 and 8 online while restricting normal services and user sessions to the other CPUs | Run controlled diagnostic workloads on the suspected core |
+| **RETIRED** (default) | Offlines the configured fault CPUs (`FAULT_CPUS`) on every boot | Keep the suspected physical core out of normal operation |
+| **LAB** (session-only) | Brings the configured fault CPUs online while restricting normal services and user sessions to the other CPUs | Run controlled diagnostic workloads on the suspected core |
 
 In addition to CPU hotplug, the boot configuration requests several layers of isolation:
 
-- **Scheduler:** `isolcpus=managed_irq,2,8`
-- **Tick and RCU:** `nohz_full=2,8` and `rcu_nocbs=2,8`
-- **Interrupt affinity:** `irqaffinity=0-1,3-7,9-11`
+- **Scheduler:** `isolcpus=domain,managed_irq,$FAULT_CPUS` (reference example: `2,8`)
+- **Tick and RCU:** `nohz_full=$FAULT_CPUS` and `rcu_nocbs=$FAULT_CPUS`
+- **Interrupt affinity:** `irqaffinity=$SAFE_CPUS`
 - **Service and session fencing:** systemd slice `AllowedCPUs` restrictions
-- **Lab execution:** `faultlab.slice` is allowed to use CPUs 2 and 8
+- **Lab execution:** `faultlab.slice` is allowed to use the configured fault CPUs
 
 CPU hotplug is the strongest retirement mechanism in this design: unlike scheduler isolation, taking a CPU offline also removes its per-CPU kernel threads. In LAB mode, isolation is not absolute; kernel threads and some kernel activity are not controlled by ordinary cgroup placement.
 
@@ -36,15 +36,15 @@ CPU hotplug is the strongest retirement mechanism in this design: unlike schedul
 | Path | Purpose |
 |---|---|
 | `apply.sh` | Installs the tools, systemd units and CPU-affinity configuration; updates GRUB |
-| `rollback.sh` | Removes installed components, restores the latest GRUB backup and brings CPUs 2/8 online |
-| `bin/faultlab` | Runs a command as root inside the dedicated lab slice, pinned to CPUs 2/8 |
+| `rollback.sh` | Removes installed components, restores a clean GRUB backup, strips isolation parameters and brings the configured fault CPUs online |
+| `bin/faultlab` | Runs a command as root inside the dedicated lab slice, pinned to the configured fault CPUs |
 | `bin/faultlab-mode` | Switches between `retired`, `lab` and `status` |
 | `bin/faultlab-verify` | Checks boot parameters, cpusets, task placement and interrupt activity |
 | `bin/faultlab-classify` | Runs the baseline, load-soak, telemetry and A/B classification sequence |
 | `bin/faultlab-ab` | Compares a command on the suspected core with a control core |
 | `bin/faultlab-crypto` | Dispatches the experimental RSA-CRT differential-fault test |
 | `bin/faultlab-watch` | Helper for watching the lab state |
-| `bin/faultlab-retire` | Offlines every CPU of the configured faulty core at boot |
+| `bin/faultlab-retire` | Compatibility helper for `faultlab-mode retired`; the boot unit uses the same mode switch |
 | `bin/faultlab-usb-restore` | Host-side fallback used by the rescue USB |
 | `lib/faultlab-common.sh` | Shared config, CPU-list and topology helpers |
 | `examples/rescue-usb/` | UEFI rescue USB builder and initramfs hook |
@@ -113,7 +113,7 @@ sudo ./apply.sh --fault-cpu N
 sudo reboot
 ```
 
-The installer configures **RETIRED** as the default mode. After reboot, confirm the state:
+The installer configures **RETIRED** as the default mode. The boot service retires the core on every boot; **LAB is session-only** and must be re-enabled after each reboot. After reboot, confirm the state:
 
 ```bash
 sudo faultlab-mode status
@@ -131,9 +131,9 @@ sudo faultlab-mode retired
 sudo faultlab-mode status
 ```
 
-This offlines logical CPUs 2 and 8. The boot-time systemd service applies the same policy when the machine starts with the configured mode set to `retired`.
+This offlines the configured fault CPUs (reference example: 2 and 8). The boot-time systemd service applies this policy on every boot, regardless of the mode left by the previous session, and runs before user sessions start.
 
-### LAB — explicit diagnostic operation
+### LAB — session-only diagnostic operation
 
 ```bash
 sudo faultlab-mode lab
@@ -141,7 +141,7 @@ sudo faultlab-mode status
 sudo faultlab-verify
 ```
 
-LAB brings CPUs 2 and 8 online. Normal system and user slices remain restricted to the non-target CPUs; commands launched through `faultlab` are placed in the dedicated lab slice.
+LAB brings the configured fault CPUs online. Normal system and user slices remain restricted to the non-target CPUs; commands launched through `faultlab` are placed in the dedicated lab slice. A reboot retires the core again; re-run `sudo faultlab-mode lab` for each session.
 
 Run a diagnostic command on the target core like this:
 
@@ -182,8 +182,8 @@ This sequence uses the supplied stress and A/B tooling. Review its commands and 
 
 `faultlab-ab` runs the supplied command repeatedly on:
 
-- **Faulty candidate:** CPUs 2 and 8, through `faultlab.slice`
-- **Control:** CPUs 3 and 9, using `taskset`
+- **Faulty candidate:** configured `FAULT_CPUS`, through `faultlab.slice`
+- **Control:** configured `CONTROL_CPUS`, using `taskset`
 
 It compares return codes and SHA-256 hashes of standard output. The resulting verdicts are:
 
@@ -253,9 +253,9 @@ sudo ./rollback.sh
 sudo reboot
 ```
 
-The rollback script disables the retirement service, removes the installed systemd and tool files, restores the newest `/etc/default/grub.faultlab.*` backup it finds, runs `update-grub` and attempts to bring CPUs 2 and 8 online.
+The rollback script disables the retirement service, removes the installed systemd and tool files, restores the newest clean `/etc/default/grub.faultlab.*` backup it finds, strips any remaining faultlab parameters from `/etc/default/grub` and `grub.cfg`, runs `update-grub` and attempts to bring the configured fault CPUs online.
 
-Review the script and confirm that the selected backup is the correct one before relying on it. If no backup is found, inspect `/etc/default/grub` manually. Keep a recovery path available in case the boot configuration prevents normal startup.
+Review the script and confirm that the selected backup is the correct one before relying on it. If no clean backup is found, the script strips the parameters from the current file. Keep a recovery path available in case the boot configuration prevents normal startup.
 
 ## Documentation
 

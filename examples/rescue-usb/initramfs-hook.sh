@@ -19,8 +19,8 @@ mount -o remount,rw "$rootmnt" 2>/dev/null
 if [ ! -e "$rootmnt/etc/faultlab/mode" ] &&
     [ ! -e "$rootmnt/etc/systemd/system/faultlab-retire.service" ] &&
     [ ! -e "$rootmnt/etc/systemd/system/faultlab.slice" ] &&
-    ! grep -q 'isolcpus=managed_irq' "$rootmnt/etc/default/grub" 2>/dev/null &&
-    ! grep -q 'isolcpus=managed_irq' "$rootmnt/boot/grub/grub.cfg" 2>/dev/null &&
+    ! grep -qE 'isolcpus=(domain,)?managed_irq' "$rootmnt/etc/default/grub" 2>/dev/null &&
+    ! grep -qE 'isolcpus=(domain,)?managed_irq' "$rootmnt/boot/grub/grub.cfg" 2>/dev/null &&
     ! ls "$rootmnt"/etc/default/grub.faultlab.[0-9]* >/dev/null 2>&1; then
     log "no faultlab changes found; nothing to restore"
     exit 0
@@ -28,26 +28,38 @@ fi
 
 log "starting restore on $rootmnt"
 
-restored=0
-backup=""
-for candidate in "$rootmnt"/etc/default/grub.faultlab.[0-9]*; do
-    [ -f "$candidate" ] || continue
-    backup=$candidate
-done
-if [ -n "$backup" ] && [ -f "$backup" ]; then
-    cp -a "$backup" "$rootmnt/etc/default/grub" && restored=1
-    log "restored $backup -> /etc/default/grub"
-fi
-
-if [ "$restored" -eq 0 ] && [ -f "$rootmnt/etc/default/grub" ]; then
-    cp -a "$rootmnt/etc/default/grub" "$rootmnt/etc/default/grub.faultlab-usb-before"
+strip_grub_params() {
     sed -i -E \
         -e 's/[[:space:]]+(isolcpus|nohz_full|rcu_nocbs|irqaffinity)=[^"[:space:]]*//g' \
         -e 's/"(isolcpus|nohz_full|rcu_nocbs|irqaffinity)=[^"[:space:]]*[[:space:]]*/"/g' \
         -e 's/(GRUB_CMDLINE_LINUX_DEFAULT=")[[:space:]]+/\1/' \
         -e 's/[[:space:]]+"/"/' \
-        "$rootmnt/etc/default/grub"
-    log "no backup found; stripped faultlab parameters from /etc/default/grub"
+        "$1"
+}
+
+# Prefer the newest clean pre-faultlab backup. Older installs could leave the
+# newest backup already containing faultlab parameters.
+backup=""
+clean_backup=""
+for candidate in "$rootmnt"/etc/default/grub.faultlab.[0-9]*; do
+    [ -f "$candidate" ] || continue
+    backup=$candidate
+    if ! grep -qE '(^|[[:space:]])(isolcpus|nohz_full|rcu_nocbs|irqaffinity)=' "$candidate"; then
+        clean_backup=$candidate
+    fi
+done
+restore=${clean_backup:-$backup}
+if [ -n "$restore" ] && [ -f "$restore" ]; then
+    cp -a "$restore" "$rootmnt/etc/default/grub"
+    log "restored $restore -> /etc/default/grub"
+elif [ -f "$rootmnt/etc/default/grub" ]; then
+    cp -a "$rootmnt/etc/default/grub" "$rootmnt/etc/default/grub.faultlab-usb-before"
+    log "no grub backup found; using current /etc/default/grub"
+fi
+
+if [ -f "$rootmnt/etc/default/grub" ]; then
+    strip_grub_params "$rootmnt/etc/default/grub"
+    log "stripped faultlab parameters from /etc/default/grub"
 fi
 
 rm -f "$rootmnt/etc/systemd/system/faultlab.slice" \
